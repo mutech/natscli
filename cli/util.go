@@ -229,6 +229,10 @@ func natsOpts() []nats.Option {
 	if opts().Config != nil {
 		copts, err = opts().Config.NATSOptions()
 		fisk.FatalIfError(err, "configuration error")
+
+		udsOpts, err := udsConnectOptions(opts().Config.ServerURL(), opts().Timeout)
+		fisk.FatalIfError(err, "configuration error")
+		copts = append(copts, udsOpts...)
 	}
 
 	connectionName := strings.TrimSpace(opts().ConnectionName)

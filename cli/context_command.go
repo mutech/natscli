@@ -567,6 +567,11 @@ func (c *ctxCommand) showCommand(_ *fisk.ParseContext) error {
 		if err != nil {
 			return err
 		}
+		udsOpts, err := udsConnectOptions(cfg.ServerURL(), 0)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, udsOpts...)
 		nc, err := nats.Connect(cfg.ServerURL(), opts...)
 		if err != nil {
 			return err
