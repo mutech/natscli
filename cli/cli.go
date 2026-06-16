@@ -25,6 +25,7 @@ import (
 
 	"github.com/nats-io/jsm.go/natscontext"
 
+	iu "github.com/nats-io/natscli/internal/util"
 	"github.com/nats-io/natscli/options"
 
 	"github.com/choria-io/fisk"
@@ -78,6 +79,20 @@ func SetVersion(v string) {
 	defer mu.Unlock()
 
 	Version = v
+}
+
+// SetAppName overrides the per-application subdirectory used for configuration
+// and store files (default "nats"). A customized CLI such as snats calls this
+// before parsing so its files live under its own name while remaining drop-in
+// compatible with the upstream layout.
+func SetAppName(name string) {
+	iu.AppName = name
+}
+
+// ValidStyles exposes the color-scheme names accepted by the --colors flag so a
+// customized CLI can wire the same enum without reaching into internal packages.
+func ValidStyles() []string {
+	return iu.ValidStyles()
 }
 
 // SetLogger sets a custom logger to use

@@ -59,7 +59,7 @@ func NscStore() (string, error) {
 		return "", err
 	}
 
-	dir := filepath.Join(parent, "nats", "nsc")
+	dir := filepath.Join(parent, iu.AppName, "nsc")
 	err = os.MkdirAll(dir, 0700)
 	if err != nil {
 		return "", err

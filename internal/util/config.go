@@ -21,6 +21,12 @@ import (
 	"path/filepath"
 )
 
+// AppName is the per-application subdirectory used under the XDG config and
+// data parents for configuration and store files. It defaults to "nats" so the
+// CLI behaves exactly as upstream; a customized CLI (e.g. snats) overrides it
+// before any directory is resolved.
+var AppName = "nats"
+
 type Config struct {
 	SelectedOperator string `json:"select_operator"`
 }
@@ -96,7 +102,7 @@ func ConfigDir() (string, error) {
 		return "", err
 	}
 
-	dir := filepath.Join(parent, "nats", "cli")
+	dir := filepath.Join(parent, AppName, "cli")
 	err = os.MkdirAll(dir, 0700)
 	if err != nil {
 		return "", err
