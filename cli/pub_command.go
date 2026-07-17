@@ -86,7 +86,7 @@ Available template functions are:
 
 	pub := app.Command("publish", "Generic data publish utility").Alias("pub").Action(c.publishAction)
 	pub.Tag("scope:user", "impact:rw")
-	addCheat("pub", pub)
+	addCheat("publish", pub)
 	pub.HelpLong(pubHelp)
 	pub.Arg("subject", "Subject to publish to").Required().StringVar(&c.subject)
 	pub.Arg("body", "Message body").IsSetByUser(&c.bodyIsSet).StringVar(&c.body)
@@ -114,6 +114,10 @@ func init() {
 }
 
 func (c *pubCmd) writeAtomic(nc *nats.Conn) error {
+	if len(c.atomicPending) == 0 {
+		return fmt.Errorf("no messages to publish in atomic batch")
+	}
+
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return err
@@ -273,7 +277,7 @@ func (c *pubCmd) doJetstream(nc *nats.Conn, pub *iu.Publisher) error {
 			}
 		}
 
-		if !c.quiet {
+		if pub.Tracker == nil && !c.quiet {
 			log.Printf("Published %d bytes to %q\n", len(body), subj)
 		}
 		resp, err := nc.RequestMsg(msg, opts().Timeout)
@@ -366,7 +370,7 @@ func (c *pubCmd) publishJetstream(ctx context.Context, nc *nats.Conn, pub *iu.Pu
 				if newEof {
 					eof = true
 				}
-				if body == "" && eof {
+				if body == "" && eof && pub.IsSendOnNewLine() {
 					return nil
 				}
 				c.body = body
@@ -379,7 +383,7 @@ func (c *pubCmd) publishJetstream(ctx context.Context, nc *nats.Conn, pub *iu.Pu
 				if err != nil {
 					log.Printf("Could not publish message: %s", err)
 				}
-				if eof {
+				if eof || !pub.UseStdin {
 					return nil
 				}
 				continue
@@ -406,7 +410,7 @@ func (c *pubCmd) publishNatsMsg(ctx context.Context, nc *nats.Conn, pub *iu.Publ
 				if newEof {
 					eof = true
 				}
-				if body == "" && eof {
+				if body == "" && eof && pub.IsSendOnNewLine() {
 					return nil
 				}
 				c.body = body
@@ -451,7 +455,7 @@ func (c *pubCmd) publishNatsMsg(ctx context.Context, nc *nats.Conn, pub *iu.Publ
 				}
 			}
 
-			if pub.IsSendOnEOF() || eof {
+			if !pub.UseStdin || pub.IsSendOnEOF() || eof {
 				return nil
 			}
 		}
