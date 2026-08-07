@@ -74,6 +74,13 @@ func registerCommand(name string, order int, c func(app commandHost)) {
 // SkipContexts used during tests
 var SkipContexts bool
 
+// DefaultServerURL, when non-empty, is the server used when the user selects one no
+// other way: no --server/NATS_URL, no --context, and no persisted context selection
+// (and contexts not disabled via --no-context). It is applied in preAction, before
+// the context is loaded, so --server/NATS_URL and any selected context still win.
+// Consumers set it to a sensible local default — snats uses the snatsd UDS socket.
+var DefaultServerURL string
+
 func SetVersion(v string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -181,6 +188,12 @@ func ConfigureInApp(app *fisk.Application, cliOpts *options.Options, prepare boo
 }
 
 func preAction(_ *fisk.ParseContext) (err error) {
+	// Apply the caller's default server before loading the context, but only when
+	// nothing else selects one — so --server/NATS_URL and any selected context win.
+	if o := options.DefaultOptions; DefaultServerURL != "" && o.Servers == "" &&
+		(SkipContexts || (o.CfgCtx == "" && natscontext.SelectedContext() == "")) {
+		o.Servers = DefaultServerURL
+	}
 	err = loadContext(true)
 	if errors.Is(err, ErrContextNotFound) {
 		fmt.Printf("The selected context %q was not found, unselecting it\n", natscontext.SelectedContext())
