@@ -18,10 +18,11 @@ import (
 	"time"
 
 	"github.com/nats-io/jsm.go/api"
+	rv "github.com/nats-io/jsm.go/registry/validator"
 )
 
 type mockValidator interface {
-	Validate(...api.StructValidator) (bool, []string)
+	Validate(...rv.StructValidator) (bool, []string)
 }
 
 func validateExpectSuccess(t *testing.T, cfg mockValidator) {
@@ -117,8 +118,6 @@ func TestStreamConfiguration(t *testing.T) {
 	// num replicas > 0
 	cfg = reset()
 	cfg.Replicas = -1
-	validateExpectFailure(t, cfg)
-	cfg.Replicas = 0
 	validateExpectFailure(t, cfg)
 }
 

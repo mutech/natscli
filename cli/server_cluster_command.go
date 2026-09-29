@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,23 +14,31 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/nats-io/jsm.go"
 	"github.com/nats-io/jsm.go/api"
 	"github.com/nats-io/jsm.go/connbalancer"
 	"github.com/nats-io/jsm.go/serverdata"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	iu "github.com/nats-io/natscli/internal/util"
+	"github.com/synadia-io/orbit.go/natsext"
 
 	"github.com/choria-io/fisk"
 )
 
 type SrvClusterCmd struct {
-	json              bool
 	force             bool
 	peer              string
 	placementCluster  string
@@ -43,6 +51,7 @@ type SrvClusterCmd struct {
 	balanceSubject    string
 	balanceRunTime    time.Duration
 	balanceKinds      []string
+	peerName          string
 }
 
 func configureServerClusterCommand(srv *fisk.CmdClause) {
@@ -61,19 +70,195 @@ func configureServerClusterCommand(srv *fisk.CmdClause) {
 	balance.Flag("kind", "Balance only certain kinds of connection (*Client, Leafnode)").Default("Client").EnumsVar(&c.balanceKinds, "Client", "Leafnode")
 	balance.Flag("force", "Force rebalance without prompting").Short('f').UnNegatableBoolVar(&c.force)
 
+	evacuate := cluster.Command("evacuate", "Move all JetStream assets for a peer to other peers").Action(c.evacuateAction)
+	evacuate.Tag("scope:system", "impact:rw")
+	evacuate.Arg("peer", "The name of the peer to remove").StringVar(&c.peerName)
+	evacuate.Flag("force", "Force evacuation without prompting").Short('f').UnNegatableBoolVar(&c.force)
+
 	sd := cluster.Command("step-down", "Force a new leader election by standing down the current meta leader").Alias("stepdown").Alias("sd").Alias("elect").Alias("down").Alias("d").Action(c.metaLeaderStandDownAction)
 	sd.Tag("scope:system", "impact:rw")
 	sd.Flag("cluster", "Request placement of the leader in a specific cluster").StringVar(&c.placementCluster)
 	sd.Flag("tags", "Request placement of the leader on nodes with specific tag(s)").StringsVar(&c.placementTags)
 	sd.Flag("host", "Request placement of the leader on a specific node").StringVar(&c.placementNode)
-	sd.Flag("json", "Produce JSON output").Short('j').UnNegatableBoolVar(&c.json)
 	sd.Flag("force", "Force leader step down ignoring current leader").Short('f').UnNegatableBoolVar(&c.force)
 
 	rm := cluster.Command("peer-remove", "Removes a server from a JetStream cluster").Alias("rm").Alias("pr").Action(c.metaPeerRemoveAction)
 	rm.Tag("scope:system", "impact:rw")
 	rm.Arg("name", "The Server Name or ID to remove from the JetStream cluster").Required().StringVar(&c.peer)
 	rm.Flag("force", "Force removal without prompting").Short('f').UnNegatableBoolVar(&c.force)
-	rm.Flag("json", "Produce JSON output").Short('j').UnNegatableBoolVar(&c.json)
+
+	rescue := cluster.Command("rescue", "Perform a cluster rescue operation").Action(c.metaRescueAction)
+	rescue.Tag("scope:system", "impact:rw")
+}
+
+func (c *SrvClusterCmd) metaRescueAction(_ *fisk.ParseContext) error {
+	nc, _, err := prepareHelper("", natsOpts()...)
+	if err != nil {
+		return err
+	}
+
+	data, err := serverdata.NewLive(nc, func(req any, subj string, waitFor int, nc *nats.Conn) ([][]byte, error) {
+		return serverdata.DoReq(ctx, req, subj, waitFor, nc, opts().Timeout, traceLogger())
+	}, 0)
+	if err != nil {
+		return err
+	}
+	defer data.Close()
+
+	jszResponses, err := data.Jsz(server.JszEventOptions{})
+	if err != nil {
+		return err
+	}
+
+	if len(jszResponses) == 0 {
+		return errors.New("no JetStream cluster status received")
+	}
+
+	minOnline := math.MaxInt32
+	hasLeader := []bool{}
+	domains := map[string]struct{}{}
+	matched := 0
+	domain := opts().Config.JSDomain()
+
+	tbl := iu.NewTableWriter(opts(), "Current Cluster State")
+	tbl.AddHeaders("Server", "Cluster", "Size", "Peers", "Quorum Requires", "Rescuing")
+	for _, jsz := range jszResponses {
+		if jsz.Server == nil || jsz.Data == nil {
+			continue
+		}
+
+		domains[jsz.Server.Domain] = struct{}{}
+		if jsz.Server.Domain != domain {
+			continue
+		}
+
+		if !iu.VersionIsAtLeast(jsz.Server.Version, 2, 15, 0) {
+			fmt.Printf("Server %q version %q is too old, requires at least 2.15.0\n", jsz.Server.Name, jsz.Server.Version)
+			continue // possibly a leaf node so we only log it
+		}
+
+		if jsz.Data.Meta == nil {
+			continue // leaf nodes without clusters maybe or old machines
+		}
+
+		online := 0
+		srv := jsz.Server.Name
+
+		meta := jsz.Data.Meta
+		hasLeader = append(hasLeader, meta.Leader != "")
+		matched++
+
+		qr := f(meta.QuorumNeeded)
+		size := f(meta.Size)
+		for _, replica := range meta.Replicas {
+			if !replica.Offline {
+				online++
+			}
+		}
+		if online < minOnline {
+			minOnline = online
+		}
+
+		tp := len(meta.Replicas)
+		if meta.Leader != "" {
+			tp++
+			online++
+		}
+		peers := fmt.Sprintf("%d online / %d peers", online, tp)
+
+		if srv == meta.Leader {
+			srv = srv + "*"
+		}
+
+		tbl.AddRow(srv, jsz.Server.Cluster, size, peers, qr, f(meta.Rescue))
+	}
+
+	if matched == 0 {
+		if len(domains) > 1 {
+			names := iu.MapKeys(domains)
+			slices.Sort(names)
+			for i, d := range names {
+				if d == "" {
+					names[i] = "no domain"
+				}
+			}
+
+			return fmt.Errorf("multiple domains found, pick one from %s", strings.Join(names, ", "))
+		}
+		return fmt.Errorf("no compatible servers found")
+	}
+
+	fmt.Println(tbl.Render())
+
+	if slices.Contains(hasLeader, true) {
+		fmt.Println("Cluster is healthy with a leader, no rescue needed")
+		return nil
+	}
+
+	fmt.Println("Rescuing a cluster is for situations where a server was removed that can not come back")
+	fmt.Println("without first using the peer-remove command.")
+	fmt.Println()
+	fmt.Println("Rescue will temporarily lower the number of servers required to form a healthy cluster")
+	fmt.Println("so new nodes can be added replacing the removed ones.")
+	fmt.Println()
+	fmt.Println("Use the above report to determine the minimum number of servers required to form a cluster.")
+	fmt.Println()
+
+	var req int
+	err = iu.AskOne(&survey.Input{
+		Message: "How many peers to require for a meta cluster quorum",
+		Default: strconv.Itoa(minOnline),
+	}, &req)
+	if err != nil {
+		return err
+	}
+
+	if req < 1 || req > matched {
+		return fmt.Errorf("cluster quorum required to be greater than 0 and less than or equal the total amount of servers")
+	}
+
+	apiReq := api.JSApiMetaRescueRequest{QuorumNeeded: req}
+	jreq, err := json.Marshal(apiReq)
+	if err != nil {
+		return err
+	}
+
+	to, cancel := context.WithTimeout(ctx, opts().Timeout)
+	defer cancel()
+
+	rResp, err := natsext.RequestMany(to, nc, jsm.APISubject(api.JSApiRescueRequest, "", domain), jreq, natsext.RequestManyMaxMessages(matched))
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+
+	for msg, err := range rResp {
+		if err != nil {
+			fmt.Printf("Unknown error received while handling rescue request responses: %v\n", err)
+			continue
+		}
+
+		var resp api.JSApiMetaRescueResponse
+		err = json.Unmarshal(msg.Data, &resp)
+		if err != nil {
+			fmt.Printf("Error unmarshalling response: %s\n", string(msg.Data))
+			continue
+		}
+		if resp.Error != nil {
+			fmt.Printf("Server %q: %v \n", resp.Server, resp.Error.Error())
+			continue
+		}
+
+		fmt.Printf("Server %q now requires %d quorum size (was %d)\n", resp.Server, resp.NewQuorum, resp.PrevQuorum)
+	}
+
+	fmt.Println()
+	fmt.Println("The final step is to use the 'nats server cluster peer-remove' command to remove the")
+	fmt.Println("servers you removed from the cluster. Once only the required amount of nodes are up")
+	fmt.Println("and in the meta cluster normal operations will resume.")
+
+	return nil
 }
 
 func (c *SrvClusterCmd) balanceAction(_ *fisk.ParseContext) error {
@@ -170,12 +355,15 @@ func (c *SrvClusterCmd) metaPeerRemoveAction(_ *fisk.ParseContext) error {
 		return err
 	}
 
-	// a configured domain would make the manager send the removal to a domain prefixed
+	// a configured domain would make the manager send the purge to a domain prefixed
 	// API subject which has no responders on the system account, causing an error the user
-	// won't expect. Silently ignoring it could cause us to accidentally remove a peer from a
-	// cluster we didn't expect, so we terminate early.
+	// won't expect. Silently ignoring it could cause us to accidentally purge an account in a
+	// domain we didn't expect, so we terminate early.
+	//
+	// This one can only change once serverdata.CurrentActiveServers is domain aware and then
+	// we need to pass a domain filter into ds.Jsz() below
 	if opts().Config.JSDomain() != "" {
-		return fmt.Errorf("the --js-domain option cannot be used with peer-remove: JetStream domains do not apply to the system account, connect without a domain configured")
+		return fmt.Errorf("the --js-domain option cannot be used: JetStream domains do not apply to the system account, connect without a domain configured")
 	}
 
 	reqFn := func(req any, subj string, waitFor int, nc *nats.Conn) ([][]byte, error) {
@@ -277,18 +465,142 @@ which may lead to duplicate deliveries.`)
 	return nil
 }
 
+func (c *SrvClusterCmd) evacuateAction(_ *fisk.ParseContext) error {
+	nc, mgr, err := prepareHelper("", natsOpts()...)
+	if err != nil {
+		return err
+	}
+
+	domain := opts().Config.JSDomain()
+
+	live, err := serverdata.NewLive(nc, func(req any, subj string, waitFor int, nc *nats.Conn) ([][]byte, error) {
+		return serverdata.DoReq(ctx, req, subj, waitFor, nc, opts().Timeout, traceLogger())
+	}, 0)
+	if err != nil {
+		return err
+	}
+
+	responses, err := live.Jsz(server.JszEventOptions{
+		EventFilterOptions: server.EventFilterOptions{Domain: domain},
+		JSzOptions:         server.JSzOptions{LeaderOnly: true},
+	})
+	if err != nil {
+		return err
+	}
+
+	var leaders []*server.ServerAPIJszResponse
+
+	for _, s := range responses {
+		switch {
+		case s.Server == nil:
+			continue
+		case domain == "":
+			leaders = append(leaders, s)
+		case s.Server.Domain == domain:
+			leaders = append(leaders, s)
+		}
+	}
+
+	if len(leaders) == 0 {
+		return fmt.Errorf("did not find any active leader")
+	}
+
+	if len(leaders) > 1 {
+		return fmt.Errorf("received responses from multiple leaders, specify a domain to target using --js-domain")
+	}
+
+	lead := leaders[0]
+	peerNames := []string{lead.Data.Meta.Leader}
+	for _, r := range lead.Data.Meta.Replicas {
+		peerNames = append(peerNames, r.Name)
+	}
+
+	if c.peerName == "" {
+		err = iu.AskOne(&survey.Select{
+			Message: "Select a Peer",
+			Options: peerNames,
+		}, &c.peerName)
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Printf("Evacuating assets from peer %q", c.peerName)
+
+	if !c.force {
+		ok, err := askConfirmation(fmt.Sprintf("Really evacuate %q", c.peerName), false)
+		fisk.FatalIfError(err, "could not obtain confirmation")
+
+		if !ok {
+			return nil
+		}
+	}
+
+	poll := func() bool {
+		responses, err := live.Jsz(server.JszEventOptions{
+			EventFilterOptions: server.EventFilterOptions{Name: c.peerName, Domain: domain},
+		})
+		if err != nil {
+			return true
+		}
+
+		if len(responses) != 1 {
+			return true
+		}
+
+		fmt.Printf("Server %q: Streams: %d Consumers: %d\n", c.peerName, responses[0].Data.Streams, responses[0].Data.Consumers)
+
+		if responses[0].Data.Streams == 0 && responses[0].Data.Consumers == 0 {
+			return false
+		}
+
+		return true
+	}
+
+	err = mgr.MetaEvacuatePeer(c.peerName, c.peer)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+	log.Printf("Requested evacuation of peer %q, watching progress for up to 5 minutes", c.peerName)
+	fmt.Println()
+
+	if !poll() {
+		return nil
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	timer := time.NewTimer(5 * time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			if !poll() {
+				return nil
+			}
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for evacuation of peer %q review progress with 'nats server report jetstream'", c.peerName)
+		}
+	}
+}
+
 func (c *SrvClusterCmd) metaLeaderStandDownAction(_ *fisk.ParseContext) error {
 	nc, mgr, err := prepareHelper("", natsOpts()...)
 	if err != nil {
 		return err
 	}
 
-	// a configured domain would make the manager send the request to a domain prefixed
+	// a configured domain would make the manager send the removal to a domain prefixed
 	// API subject which has no responders on the system account, causing an error the user
-	// won't expect. Silently ignoring it could cause us to accidentally step down a leader in
-	// a cluster we didn't expect, so we terminate early.
+	// won't expect. Silently ignoring it could cause us to accidentally remove a peer from a
+	// cluster we didn't expect, so we terminate early.
+	//
+	// However, since 2.15 the system account is domain aware
 	if opts().Config.JSDomain() != "" {
-		return fmt.Errorf("the --js-domain option cannot be used with step-down: JetStream domains do not apply to the system account, connect without a domain configured")
+		err = iu.RequireAPILevel(mgr, 5, "the --js-domain option cannot be used: JetStream domains do not apply to the system account, connect without a domain configured")
+		if err != nil {
+			return err
+		}
 	}
 
 	reqFn := func(req any, subj string, waitFor int, nc *nats.Conn) ([][]byte, error) {
@@ -305,7 +617,11 @@ func (c *SrvClusterCmd) metaLeaderStandDownAction(_ *fisk.ParseContext) error {
 	}
 
 	getJSI := func() (*server.JSInfo, error) {
-		jszResults, err := ds.Jsz(server.JszEventOptions{})
+		jszResults, err := ds.Jsz(server.JszEventOptions{
+			EventFilterOptions: server.EventFilterOptions{
+				Domain: opts().Config.JSDomain(),
+			},
+		})
 		if err != nil {
 			return nil, err
 		}

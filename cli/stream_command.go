@@ -22,11 +22,10 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -85,10 +84,7 @@ type streamCmd struct {
 	reportLeaderDistrib    bool
 	discardPolicy          string
 	validateOnly           bool
-	backupDirectory        string
 	showProgress           bool
-	healthCheck            bool
-	snapShotConsumers      bool
 	dupeWindow             string
 	replicas               int64
 	placementCluster       string
@@ -162,8 +158,6 @@ type streamCmd struct {
 	selectedStream            *jsm.Stream
 	nc                        *nats.Conn
 	mgr                       *jsm.Manager
-	chunkSize                 string
-	wndSize                   string
 	placementPreferred        string
 	allowMsgTTlSet            bool
 	allowMsgTTL               bool
@@ -414,24 +408,9 @@ Finding streams with certain subjects configured:
 	strGet.Flag("json", "Produce JSON output").Short('j').UnNegatableBoolVar(&c.json)
 	strGet.Flag("translate", "Translate the message data by running it through the given command before output").StringVar(&c.vwTranslate)
 
-	strBackup := str.Command("backup", "Creates a backup of a stream over the NATS network").Alias("snapshot").Action(c.backupAction)
-	strBackup.Tag("scope:user", "impact:ro")
-	strBackup.Arg("stream", "Stream to backup").Required().StringVar(&c.stream)
-	strBackup.Arg("target", "Directory to create the backup in").Required().StringVar(&c.backupDirectory)
-	strBackup.Flag("progress", "Enables or disables progress reporting using a progress bar").Default("true").BoolVar(&c.showProgress)
-	strBackup.Flag("check", "Checks the stream for health prior to backup").UnNegatableBoolVar(&c.healthCheck)
-	strBackup.Flag("consumers", "Enable or disable consumer backups").Default("true").BoolVar(&c.snapShotConsumers)
-	strBackup.Flag("chunk-size", "Sets a specific chunk size that the server will send").StringVar(&c.chunkSize)
-	strBackup.Flag("window-size", "Sets a specific window size that the server will send").StringVar(&c.wndSize)
-
-	strRestore := str.Command("restore", "Restore a stream over the NATS network").Action(c.restoreAction)
-	strRestore.Tag("scope:user", "impact:rw")
-	strRestore.Arg("file", "The directory holding the backup to restore").Required().ExistingDirVar(&c.backupDirectory)
-	strRestore.Flag("progress", "Enables or disables progress reporting using a progress bar").Default("true").BoolVar(&c.showProgress)
-	strRestore.Flag("config", "Load a different configuration when restoring the stream").ExistingFileVar(&c.inputFile)
-	strRestore.Flag("cluster", "Place the stream in a specific cluster").StringVar(&c.placementCluster)
-	strRestore.Flag("tag", "Place the stream on servers that has specific tags (pass multiple times)").StringsVar(&c.placementTags)
-	strRestore.Flag("replicas", "Override how many replicas of the data to create").Int64Var(&c.replicas)
+	backup := &backupCmd{}
+	backup.streamBackupCommand(str, "backup").Alias("snapshot").Hidden().PreAction(deprecatedCommand("nats stream backup", "nats backup stream"))
+	backup.streamRestoreCommand(str, "restore").Hidden().PreAction(deprecatedCommand("nats stream restore", "nats backup restore stream"))
 
 	strSeal := str.Command("seal", "Seals a stream preventing further updates").Action(c.sealAction)
 	strSeal.Tag("scope:user", "impact:rw")
@@ -472,11 +451,22 @@ Finding streams with certain subjects configured:
 	strClusterBalance.Flag("invert", "Invert the check - before becomes after, with becomes without").BoolVar(&c.fInvert)
 	strClusterBalance.Flag("expression", "Balance matching streams using an expression language").StringVar(&c.fExpression)
 
-	strClusterRemovePeer := strCluster.Command("peer-remove", "Removes a peer from the stream cluster").Alias("pr").Action(c.removePeer)
+	strClusterCancelMove := strCluster.Command("cancel-move", "Cancels an in-progress stream move").Action(c.cancelMove)
+	strClusterCancelMove.Tag("scope:user", "impact:rw")
+	strClusterCancelMove.Arg("stream", "The stream to act on").StringVar(&c.stream)
+	strClusterCancelMove.Flag("force", "Force cancel without prompting or checks").Short('f').UnNegatableBoolVar(&c.force)
+
+	strClusterRemovePeer := strCluster.Command("peer-remove", "Removes a peer from the stream cluster").Alias("pr").Hidden().Action(c.removePeer)
 	strClusterRemovePeer.Tag("scope:user", "impact:rw")
 	strClusterRemovePeer.Arg("stream", "The stream to act on").StringVar(&c.stream)
 	strClusterRemovePeer.Arg("peer", "The name of the peer to remove").StringVar(&c.peerName)
 	strClusterRemovePeer.Flag("force", "Force sealing without prompting").Short('f').UnNegatableBoolVar(&c.force)
+
+	strClusterEvacuatePeer := strCluster.Command("evacuate", "Removes a stream from a peer").Action(c.evacuatePeer)
+	strClusterEvacuatePeer.Tag("scope:user", "impact:rw")
+	strClusterEvacuatePeer.Arg("stream", "The stream to act on").StringVar(&c.stream)
+	strClusterEvacuatePeer.Arg("peer", "The name of the peer to remove").StringVar(&c.peerName)
+	strClusterEvacuatePeer.Flag("force", "Force evacuation without prompt").Short('f').UnNegatableBoolVar(&c.force)
 }
 
 func init() {
@@ -760,33 +750,9 @@ func (c *streamCmd) subjectsAction(_ *fisk.ParseContext) (err error) {
 		return nil
 	}
 
-	var longest int
-	var most uint64
-	var names []string
-
-	for s, c := range subs {
+	names := make([]string, 0, len(subs))
+	for s := range subs {
 		names = append(names, s)
-		if len(s) > longest {
-			longest = len(s)
-		}
-		if c > most {
-			most = c
-		}
-	}
-
-	cols := 1
-	countWidth := len(f(most))
-	table := iu.NewTableWriterf(opts(), "%d Subjects in stream %s", len(names), c.stream)
-
-	switch {
-	case longest+countWidth < 20:
-		cols = 3
-		table.AddHeaders("Subject", "Count", "Subject", "Count", "Subject", "Count")
-	case longest+countWidth < 30:
-		cols = 2
-		table.AddHeaders("Subject", "Count", "Subject", "Count")
-	default:
-		table.AddHeaders("Subject", "Count")
 	}
 
 	sort.Slice(names, func(i, j int) bool {
@@ -804,24 +770,7 @@ func (c *streamCmd) subjectsAction(_ *fisk.ParseContext) (err error) {
 		return
 	}
 
-	comma := func(i uint64) string {
-		if i == 0 {
-			return ""
-		}
-		return f(i)
-	}
-
-	iu.SliceGroups(names, cols, func(g []string) {
-		if cols == 1 {
-			table.AddRow(g[0], comma(subs[g[0]]))
-		} else if cols == 2 {
-			table.AddRow(g[0], comma(subs[g[0]]), g[1], comma(subs[g[1]]))
-		} else {
-			table.AddRow(g[0], comma(subs[g[0]]), g[1], comma(subs[g[1]]), g[2], comma(subs[g[2]]))
-		}
-	})
-
-	fmt.Println(table.Render())
+	fmt.Println(subjectsTable(fmt.Sprintf("%d Subjects in stream %s", len(names), c.stream), names, subs).Render())
 
 	return nil
 }
@@ -1067,7 +1016,84 @@ func (c *streamCmd) leaderStandDown(_ *fisk.ParseContext) error {
 	return c.showStream(stream)
 }
 
-func (c *streamCmd) removePeer(_ *fisk.ParseContext) error {
+func (c *streamCmd) cancelMove(_ *fisk.ParseContext) error {
+	c.connectAndAskStream()
+
+	var err error
+
+	if !c.force {
+		if c.selectedStream == nil {
+			c.selectedStream, err = c.mgr.LoadStream(c.stream)
+			if err != nil {
+				return err
+			}
+		}
+
+		nfo, err := c.selectedStream.Information()
+		if err != nil {
+			return err
+		}
+
+		if nfo.Cluster == nil {
+			return fmt.Errorf("stream is not clustered")
+		}
+
+		if nfo.Cluster.Desired == nil {
+			return fmt.Errorf("stream is not busy moving")
+		}
+
+		ok, err := askConfirmation(fmt.Sprintf("Really cancel move of %q", c.selectedStream.Name()), false)
+		fisk.FatalIfError(err, "could not obtain confirmation")
+
+		if !ok {
+			return fmt.Errorf("canceling request")
+		}
+	}
+
+	_, err = c.mgr.CancelStreamMove(c.stream)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Canceled move of %q\n", c.stream)
+
+	if !c.force {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		fmt.Print("Waiting for move to finish")
+
+		ctr := 0
+		for {
+			select {
+			case <-ticker.C:
+				ctr++
+				fmt.Print(".")
+				nfo, err := c.selectedStream.Information()
+				if err != nil {
+					continue
+				}
+
+				if nfo.Cluster == nil || nfo.Cluster.Desired == nil {
+					fmt.Println()
+					c.showStreamInfo(nfo)
+					return nil
+				}
+
+				if ctr == 20 {
+					fmt.Println("Canceling move did not complete, review status using 'nats stream info'")
+				}
+
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *streamCmd) evacuatePeer(_ *fisk.ParseContext) error {
 	c.connectAndAskStream()
 
 	stream, err := c.loadStream(c.stream)
@@ -1081,6 +1107,88 @@ func (c *streamCmd) removePeer(_ *fisk.ParseContext) error {
 	}
 
 	if info.Cluster == nil {
+		return fmt.Errorf("stream %q is not clustered", stream.Name())
+	}
+
+	peerNames := []string{info.Cluster.Leader}
+	for _, r := range info.Cluster.Replicas {
+		peerNames = append(peerNames, r.Name)
+	}
+
+	if c.peerName == "" {
+		err = iu.AskOne(&survey.Select{
+			Message: "Select a Peer",
+			Options: peerNames,
+		}, &c.peerName)
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Printf("Evacuating stream from peer %q", c.peerName)
+
+	if !c.force {
+		ok, err := askConfirmation(fmt.Sprintf("Really evacuate %q", c.peerName), false)
+		fisk.FatalIfError(err, "could not obtain confirmation")
+
+		if !ok {
+			return nil
+		}
+	}
+
+	err = stream.EvacuatePeer(c.peerName)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Requested evacuation of peer %q", c.peerName)
+
+	log.Printf("Waiting up to 1 minute for peer state to change")
+	fmt.Println()
+	ticker := time.NewTicker(1 * time.Second)
+	to := time.NewTimer(time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			nfo, err := stream.Information()
+			if err == nil {
+				peers := []string{nfo.Cluster.Leader}
+				for _, p := range nfo.Cluster.Replicas {
+					peers = append(peers, p.Name)
+				}
+
+				if !slices.Contains(peers, c.peerName) {
+					fmt.Println()
+					fmt.Println()
+					fmt.Printf("Stream peers are now: %s\n", strings.Join(peers, ", "))
+					return nil
+				}
+				fmt.Print(".")
+			}
+		case <-to.C:
+			return fmt.Errorf("stream failed to evacuate %q, review stream state using 'nats stream info'", c.peerName)
+		}
+	}
+}
+
+func (c *streamCmd) removePeer(_ *fisk.ParseContext) error {
+	fmt.Println("WARNING: Users should use the new `nats stream cluster evacuate` and replica count adjustments")
+	fmt.Println("for peer membership management which is a newer and safer approach.")
+	fmt.Println()
+
+	c.connectAndAskStream()
+
+	stream, err := c.loadStream(c.stream)
+	if err != nil {
+		return err
+	}
+
+	info, err := stream.Information()
+	if err != nil {
+		return err
+	}
+
+	if info.Cluster == nil || len(info.Cluster.Replicas) == 0 {
 		return fmt.Errorf("stream %q is not clustered", stream.Name())
 	}
 
@@ -1245,251 +1353,6 @@ func (c *streamCmd) sealAction(_ *fisk.ParseContext) error {
 	fisk.FatalIfError(err, "could not seal Stream")
 
 	return c.showStream(stream)
-}
-
-func (c *streamCmd) restoreAction(_ *fisk.ParseContext) error {
-	_, mgr, err := prepareHelper("", natsOpts()...)
-	fisk.FatalIfError(err, "setup failed")
-
-	var bm api.JSApiStreamRestoreRequest
-	bmj, err := os.ReadFile(filepath.Join(c.backupDirectory, "backup.json"))
-	fisk.FatalIfError(err, "restore failed")
-	err = json.Unmarshal(bmj, &bm)
-	fisk.FatalIfError(err, "restore failed")
-
-	var cfg *api.StreamConfig
-
-	known, err := mgr.IsKnownStream(bm.Config.Name)
-	fisk.FatalIfError(err, "Could not check if the stream already exist")
-	if known {
-		fisk.Fatalf("Stream %q already exist", bm.Config.Name)
-	}
-
-	var progbar progress.Writer
-	var tracker *progress.Tracker
-	var prevMsg time.Time
-
-	cb := func(p jsm.RestoreProgress) {
-		if opts().Trace && (p.ChunksSent()%100 == 0 || time.Since(prevMsg) > 500*time.Millisecond) {
-			fmt.Printf("Sent %v chunk %v / %v at %v / s\n", fiBytes(uint64(p.ChunkSize())), p.ChunksSent(), p.ChunksToSend(), fiBytes(p.BytesPerSecond()))
-			return
-		}
-
-		prevMsg = time.Now()
-
-		if progbar == nil {
-			progbar, tracker, _ = iu.NewProgress(opts(), &progress.Tracker{
-				Total: int64(p.ChunksToSend() * p.ChunkSize()),
-				Units: progress.UnitsBytes,
-			})
-		}
-
-		tracker.SetValue(int64(p.ChunksSent() * uint32(p.ChunkSize())))
-	}
-
-	var ropts []jsm.SnapshotOption
-
-	if c.showProgress {
-		ropts = append(ropts, jsm.RestoreNotify(cb))
-	} else {
-		ropts = append(ropts, jsm.SnapshotDebug())
-	}
-
-	if c.inputFile != "" {
-		cfg, err = c.loadConfigFile(c.inputFile)
-		if err != nil {
-			return err
-		}
-
-		// we need to confirm this new config has the same stream
-		// name as the snapshot else the server state can get confused
-		// see https://github.com/nats-io/nats-server/issues/2850
-		if bm.Config.Name != cfg.Name {
-			return fmt.Errorf("stream names may not be changed during restore")
-		}
-	} else {
-		cfg = &bm.Config
-	}
-
-	if c.placementCluster != "" || len(c.placementTags) > 0 {
-		cfg.Placement = &api.Placement{
-			Cluster: c.placementCluster,
-			Tags:    c.placementTags,
-		}
-	}
-
-	if c.replicas > 0 {
-		cfg.Replicas = int(c.replicas)
-	}
-
-	if cfg != nil {
-		ropts = append(ropts, jsm.RestoreConfiguration(*cfg))
-	}
-
-	fmt.Printf("Starting restore of Stream %q from file %q\n\n", bm.Config.Name, c.backupDirectory)
-
-	fp, _, err := mgr.RestoreSnapshotFromDirectory(ctx, bm.Config.Name, c.backupDirectory, ropts...)
-	fisk.FatalIfError(err, "restore failed")
-	if c.showProgress {
-		tracker.SetValue(int64(fp.ChunksSent() * uint32(fp.ChunkSize())))
-		time.Sleep(300 * time.Millisecond)
-		progbar.Stop()
-	}
-
-	fmt.Println()
-	fmt.Printf("Restored stream %q in %v\n", bm.Config.Name, fp.EndTime().Sub(fp.StartTime()).Round(time.Second))
-	fmt.Println()
-
-	stream, err := mgr.LoadStream(bm.Config.Name)
-	fisk.FatalIfError(err, "could not request Stream info")
-	err = c.showStream(stream)
-	fisk.FatalIfError(err, "could not show stream")
-
-	return nil
-}
-
-func backupStream(stream *jsm.Stream, showProgress bool, consumers bool, check bool, target string, chunkSize, wndSize int) error {
-	first := true
-	pmu := sync.Mutex{}
-	expected := 1
-	timedOut := false
-
-	var progbar progress.Writer
-	var tracker *progress.Tracker
-	var err error
-	var prevMsg time.Time
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	idleTimeout := 5 * time.Second
-	if opts().Timeout > idleTimeout {
-		idleTimeout = opts().Timeout
-	}
-
-	timeout := time.AfterFunc(idleTimeout, func() {
-		cancel()
-		timedOut = true
-	})
-
-	var received uint32
-
-	cb := func(p jsm.SnapshotProgress) {
-		if tracker == nil && showProgress {
-			if p.BytesExpected() > 0 {
-				expected = int(p.BytesExpected())
-			}
-			progbar, tracker, err = iu.NewProgress(opts(), &progress.Tracker{
-				Total: int64(expected),
-				Units: iu.ProgressUnitsIBytes,
-			})
-		}
-
-		if first {
-			fmt.Printf("Starting backup of Stream %q with %s\n", stream.Name(), humanize.IBytes(p.BytesExpected()))
-			if showProgress {
-				fmt.Println()
-			}
-
-			if p.HealthCheck() {
-				fmt.Printf("Health Check was requested, this can take a long time without progress reports\n\n")
-			}
-
-			first = false
-		}
-
-		if opts().Trace {
-			if first {
-				fmt.Printf("Received %s chunk %s\n", fiBytes(uint64(p.ChunkSize())), f(p.ChunksReceived()))
-			} else {
-				fmt.Printf("Received %s chunk %s with time delta %s\n", fiBytes(uint64(p.ChunkSize())), f(p.ChunksReceived()), time.Since(prevMsg))
-			}
-		}
-
-		if p.ChunksReceived() != received {
-			timeout.Reset(idleTimeout)
-			received = p.ChunksReceived()
-		}
-
-		if tracker != nil {
-			tracker.SetValue(int64(p.UncompressedBytesReceived()))
-		}
-
-		prevMsg = time.Now()
-	}
-
-	sopts := []jsm.SnapshotOption{
-		jsm.SnapshotChunkSize(chunkSize),
-		jsm.SnapshotWindowSize(wndSize),
-		jsm.SnapshotNotify(cb),
-	}
-
-	if consumers {
-		sopts = append(sopts, jsm.SnapshotConsumers())
-	}
-
-	if opts().Trace {
-		sopts = append(sopts, jsm.SnapshotDebug())
-		showProgress = false
-	}
-
-	if check {
-		sopts = append(sopts, jsm.SnapshotHealthCheck())
-	}
-
-	fp, err := stream.SnapshotToDirectory(ctx, target, sopts...)
-	if err != nil {
-		return err
-	}
-
-	pmu.Lock()
-	if tracker != nil {
-		tracker.SetValue(int64(expected))
-		tracker.MarkAsDone()
-		time.Sleep(300 * time.Millisecond)
-		progbar.Stop()
-	}
-	pmu.Unlock()
-
-	fmt.Println()
-
-	if timedOut {
-		return fmt.Errorf("backup timed out after receiving no data for a long period")
-	}
-
-	fmt.Printf("Received %s compressed data in %s chunks for stream %q in %v, %s uncompressed \n", humanize.IBytes(fp.BytesReceived()), f(fp.ChunksReceived()), stream.Name(), fp.EndTime().Sub(fp.StartTime()).Round(time.Millisecond), fiBytes(fp.UncompressedBytesReceived()))
-
-	return nil
-}
-
-func (c *streamCmd) backupAction(_ *fisk.ParseContext) error {
-	var err error
-
-	c.nc, c.mgr, err = prepareHelper("", natsOpts()...)
-	fisk.FatalIfError(err, "setup failed")
-
-	stream, err := c.loadStream(c.stream)
-	if err != nil {
-		return err
-	}
-
-	// Default is set in strBackup flags.
-	var chunkSize, wndSize int64
-	if c.chunkSize != "" {
-		if chunkSize, err = iu.ParseStringAsBytes(c.chunkSize, 32); err != nil {
-			return err
-		}
-	}
-	if c.wndSize != "" {
-		if wndSize, err = iu.ParseStringAsBytes(c.wndSize, 32); err != nil {
-			return err
-		}
-	}
-
-	err = backupStream(stream, c.showProgress, c.snapShotConsumers, c.healthCheck, c.backupDirectory, int(chunkSize), int(wndSize))
-	fisk.FatalIfError(err, "snapshot failed")
-
-	return nil
 }
 
 func (c *streamCmd) reportAction(_ *fisk.ParseContext) error {
@@ -1958,6 +1821,10 @@ func (c *streamCmd) copyAndEditStream(cfg api.StreamConfig, pc *fisk.ParseContex
 		}
 	}
 
+	if c.noRepub {
+		cfg.RePublish = nil
+	}
+
 	if !c.noRepub && c.repubSource != "" && c.repubDest != "" {
 		cfg.RePublish = &api.RePublish{
 			Source:      c.repubSource,
@@ -2176,6 +2043,7 @@ func (c *streamCmd) showStreamConfig(cols *columns.Writer, cfg api.StreamConfig)
 	if cfg.Placement != nil {
 		cols.AddRowIfNotEmpty("Placement Cluster", cfg.Placement.Cluster)
 		cols.AddRowIf("Placement Tags", cfg.Placement.Tags, len(cfg.Placement.Tags) > 0)
+		cols.AddRowIfNotEmpty("Preferred", cfg.Placement.Preferred)
 	}
 
 	cols.AddSectionTitle("Options")
@@ -2329,6 +2197,57 @@ func (c *streamCmd) showStream(stream *jsm.Stream) error {
 	return nil
 }
 
+func (c *streamCmd) showSource(cols *columns.Writer, s *api.StreamSourceInfo) {
+	cols.AddRow("Stream Name", s.Name)
+
+	switch {
+	case s.FilterSubject != "":
+		filter := ">"
+		if s.FilterSubject != "" {
+			filter = s.FilterSubject
+		}
+
+		cols.AddRow("Subject Filter", filter)
+	case len(s.SubjectTransforms) > 0:
+		for i := range s.SubjectTransforms {
+			t := ""
+
+			if i == 0 {
+				if len(s.SubjectTransforms) > 1 {
+					t = "Subject Filters and Transforms"
+				} else {
+					t = "Subject Filter and Transform"
+				}
+			}
+
+			if s.SubjectTransforms[i].Destination == "" {
+				cols.AddRowf(t, "%s untransformed", s.SubjectTransforms[i].Source)
+			} else {
+				cols.AddRowf(t, "%s to %s", s.SubjectTransforms[i].Source, s.SubjectTransforms[i].Destination)
+			}
+		}
+	}
+
+	cols.AddRow("Lag", s.Lag)
+
+	if s.Active > 0 && s.Active < math.MaxInt64 {
+		cols.AddRow("Last Seen", s.Active)
+	} else {
+		cols.AddRow("Last Seen", "never")
+	}
+
+	if s.External != nil {
+		cols.AddRow("Ext. API Prefix", s.External.ApiPrefix)
+		if s.External.DeliverPrefix != "" {
+			cols.AddRow("Ext. Delivery Prefix", s.External.DeliverPrefix)
+		}
+	}
+
+	if s.Error != nil {
+		cols.AddRow("Error", s.Error.Description)
+	}
+}
+
 func (c *streamCmd) showStreamInfo(info *api.StreamInfo) {
 	if c.json {
 		err := iu.PrintJSON(info)
@@ -2348,11 +2267,13 @@ func (c *streamCmd) showStreamInfo(info *api.StreamInfo) {
 		cols.AddSectionTitle("Cluster Information")
 		if info.Cluster != nil && info.Cluster.Name != "" {
 			cols.AddRow("Name", info.Cluster.Name)
+			cols.AddRowIf("Cluster Traffic Account", "System Account", info.Cluster.SystemAcc)
+			cols.AddRowIf("Cluster Traffic Account", info.Cluster.TrafficAcc, !info.Cluster.SystemAcc && info.Cluster.TrafficAcc != "")
 			cols.AddRowIfNotEmpty("Cluster Group", info.Cluster.RaftGroup)
 			if info.Cluster.LeaderSince == nil {
 				cols.AddRow("Leader", info.Cluster.Leader)
 			} else {
-				cols.AddRowf("Leader", "%s (%s)", info.Cluster.Leader, f(sinceRefOrNow(info.TimeStamp, *info.Cluster.LeaderSince)))
+				cols.AddRowf("Leader", "%s (%s)", info.Cluster.Leader, f(iu.SinceRefOrNow(info.TimeStamp, *info.Cluster.LeaderSince)))
 			}
 
 			for _, r := range info.Cluster.Replicas {
@@ -2374,6 +2295,10 @@ func (c *streamCmd) showStreamInfo(info *api.StreamInfo) {
 					state = append(state, "not seen")
 				}
 
+				if r.Pending {
+					state = append(state, "(pending)")
+				}
+
 				switch {
 				case r.Lag > 1:
 					state = append(state, fmt.Sprintf("%s operations behind", f(r.Lag)))
@@ -2384,69 +2309,23 @@ func (c *streamCmd) showStreamInfo(info *api.StreamInfo) {
 				cols.AddRow("Replica", state)
 			}
 		}
+
+		if info.Cluster.Desired != nil {
+			iu.RenderDesiredState(cols, info.Cluster.Desired, info.Config.Replicas, info.Config.Placement, &info.Config.Retention, info.Cluster, info.TimeStamp)
+		}
+
 		cols.Println()
-	}
-
-	showSource := func(s *api.StreamSourceInfo) {
-		cols.AddRow("Stream Name", s.Name)
-
-		switch {
-		case s.FilterSubject != "":
-			filter := ">"
-			if s.FilterSubject != "" {
-				filter = s.FilterSubject
-			}
-
-			cols.AddRow("Subject Filter", filter)
-		case len(s.SubjectTransforms) > 0:
-			for i := range s.SubjectTransforms {
-				t := ""
-
-				if i == 0 {
-					if len(s.SubjectTransforms) > 1 {
-						t = "Subject Filters and Transforms"
-					} else {
-						t = "Subject Filter and Transform"
-					}
-				}
-
-				if s.SubjectTransforms[i].Destination == "" {
-					cols.AddRowf(t, "%s untransformed", s.SubjectTransforms[i].Source)
-				} else {
-					cols.AddRowf(t, "%s to %s", s.SubjectTransforms[i].Source, s.SubjectTransforms[i].Destination)
-				}
-			}
-		}
-
-		cols.AddRow("Lag", s.Lag)
-
-		if s.Active > 0 && s.Active < math.MaxInt64 {
-			cols.AddRow("Last Seen", s.Active)
-		} else {
-			cols.AddRow("Last Seen", "never")
-		}
-
-		if s.External != nil {
-			cols.AddRow("Ext. API Prefix", s.External.ApiPrefix)
-			if s.External.DeliverPrefix != "" {
-				cols.AddRow("Ext. Delivery Prefix", s.External.DeliverPrefix)
-			}
-		}
-
-		if s.Error != nil {
-			cols.AddRow("Error", s.Error.Description)
-		}
 	}
 
 	if info.Mirror != nil {
 		cols.AddSectionTitle("Mirror Information")
-		showSource(info.Mirror)
+		c.showSource(cols, info.Mirror)
 	}
 
 	if len(info.Sources) > 0 {
 		cols.AddSectionTitle("Source Information")
 		for _, s := range info.Sources {
-			showSource(s)
+			c.showSource(cols, s)
 			cols.Println()
 		}
 	}
@@ -3482,7 +3361,7 @@ func (c *streamCmd) renderStreamsAsTable(streams []*jsm.Stream, missing []string
 	table.AddHeaders("Name", "Description", "Created", "Messages", "Size", "Last Message")
 	for _, s := range streams {
 		nfo, _ := s.LatestInformation()
-		table.AddRow(s.Name(), s.Description(), f(nfo.Created.Local()), f(nfo.State.Msgs), humanize.IBytes(nfo.State.Bytes), f(sinceRefOrNow(nfo.TimeStamp, nfo.State.LastTime)))
+		table.AddRow(s.Name(), s.Description(), f(nfo.Created.Local()), f(nfo.State.Msgs), humanize.IBytes(nfo.State.Bytes), f(iu.SinceRefOrNow(nfo.TimeStamp, nfo.State.LastTime)))
 	}
 
 	fmt.Fprintln(&out, table.Render())

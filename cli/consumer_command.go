@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -130,6 +131,7 @@ type consumerCmd struct {
 	apiLevel           int
 	resetSeq           uint64
 	resetSeqIsSet      bool
+	peerName           string
 }
 
 func configureConsumerCommand(app commandHost) {
@@ -348,10 +350,90 @@ func configureConsumerCommand(app commandHost) {
 	conClusterBalance.Flag("pinned", "Balance Pinned Client priority group consumers that are fully pinned").UnNegatableBoolVar(&c.fPinned)
 	conClusterBalance.Flag("invert", "Invert the check - before becomes after, with becomes without").BoolVar(&c.fInvert)
 	conClusterBalance.Flag("expression", "Balance matching consumers using an expression language").StringVar(&c.fExpression)
+
+	conClusterEvacuate := conCluster.Command("evacuate", "Removes a consumer from a peer").Action(c.evacuatePeer)
+	conClusterEvacuate.Tag("scope:user", "impact:rw")
+	conClusterEvacuate.Arg("stream", "The stream to act on").StringVar(&c.stream)
+	conClusterEvacuate.Arg("consumer", "The consumer to act on").StringVar(&c.consumer)
+	conClusterEvacuate.Arg("peer", "The name of the peer to remove").StringVar(&c.peerName)
+	conClusterEvacuate.Flag("force", "Force evacuation without prompt").Short('f').UnNegatableBoolVar(&c.force)
 }
 
 func init() {
 	registerCommand("consumer", 4, configureConsumerCommand)
+}
+
+func (c *consumerCmd) evacuatePeer(_ *fisk.ParseContext) error {
+	c.connectAndSetup(true, true)
+
+	info, err := c.selectedConsumer.State()
+	if err != nil {
+		return err
+	}
+
+	if info.Cluster == nil {
+		return fmt.Errorf("consumer %q is not clustered", info.Name)
+	}
+
+	peerNames := []string{info.Cluster.Leader}
+	for _, r := range info.Cluster.Replicas {
+		peerNames = append(peerNames, r.Name)
+	}
+
+	if c.peerName == "" {
+		err = iu.AskOne(&survey.Select{
+			Message: "Select a Peer",
+			Options: peerNames,
+		}, &c.peerName)
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Printf("Evacuating consumer from peer %q", c.peerName)
+
+	if !c.force {
+		ok, err := askConfirmation(fmt.Sprintf("Really evacuate %q", c.peerName), false)
+		fisk.FatalIfError(err, "could not obtain confirmation")
+
+		if !ok {
+			return nil
+		}
+	}
+
+	err = c.selectedConsumer.EvacuatePeer(c.peerName)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Requested evacuation of peer %q", c.peerName)
+
+	log.Printf("Waiting up to 1 minute for peer state to change")
+	fmt.Println()
+	ticker := time.NewTicker(1 * time.Second)
+	to := time.NewTimer(time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			nfo, err := c.selectedConsumer.State()
+			if err == nil {
+				peers := []string{nfo.Cluster.Leader}
+				for _, p := range nfo.Cluster.Replicas {
+					peers = append(peers, p.Name)
+				}
+
+				if !slices.Contains(peers, c.peerName) {
+					fmt.Println()
+					fmt.Println()
+					fmt.Printf("Consumer peers are now: %s\n", strings.Join(peers, ", "))
+					return nil
+				}
+				fmt.Print(".")
+			}
+		case <-to.C:
+			return fmt.Errorf("consumer failed to evacuate %q, review stream state using 'nats consumer info'", c.peerName)
+		}
+	}
 }
 
 func (c *consumerCmd) resetAction(_ *fisk.ParseContext) error {
@@ -1119,9 +1201,9 @@ func (c *consumerCmd) renderConsumerAsTable(stream *jsm.Stream) (string, error) 
 			return
 		}
 
-		lastDelivery := sinceRefOrNow(cs.TimeStamp, time.Time{})
+		lastDelivery := iu.SinceRefOrNow(cs.TimeStamp, time.Time{})
 		if cs.Delivered.Last != nil {
-			lastDelivery = sinceRefOrNow(cs.TimeStamp, *cs.Delivered.Last)
+			lastDelivery = iu.SinceRefOrNow(cs.TimeStamp, *cs.Delivered.Last)
 		}
 
 		table.AddRow(cs.Name, cs.Config.Description, f(cs.Created.Local()), cs.NumAckPending, cs.NumPending, f(lastDelivery))
@@ -1279,7 +1361,7 @@ func (c *consumerCmd) showInfo(config api.ConsumerConfig, state api.ConsumerInfo
 		if state.Cluster.LeaderSince == nil {
 			cols.AddRow("Leader", state.Cluster.Leader)
 		} else {
-			cols.AddRowf("Leader", "%s (%s)", state.Cluster.Leader, f(sinceRefOrNow(state.TimeStamp, *state.Cluster.LeaderSince)))
+			cols.AddRowf("Leader", "%s (%s)", state.Cluster.Leader, f(iu.SinceRefOrNow(state.TimeStamp, *state.Cluster.LeaderSince)))
 		}
 		for _, r := range state.Cluster.Replicas {
 			since := fmt.Sprintf("seen %s ago", f(r.Active))
@@ -1293,6 +1375,11 @@ func (c *consumerCmd) showInfo(config api.ConsumerConfig, state api.ConsumerInfo
 				cols.AddRowf("Replica", "%s, outdated, %s", r.Name, since)
 			}
 		}
+
+		if state.Cluster.Desired != nil {
+			iu.RenderDesiredState(cols, state.Cluster.Desired, state.Config.Replicas, nil, nil, state.Cluster, state.TimeStamp)
+
+		}
 	}
 
 	cols.AddSectionTitle("State")
@@ -1300,14 +1387,14 @@ func (c *consumerCmd) showInfo(config api.ConsumerConfig, state api.ConsumerInfo
 	if state.Delivered.Last == nil {
 		cols.AddRowf("Last Delivered Message", "Consumer sequence: %s Stream sequence: %s", f(state.Delivered.Consumer), f(state.Delivered.Stream))
 	} else {
-		cols.AddRowf("Last Delivered Message", "Consumer sequence: %s Stream sequence: %s Last delivery: %s ago", f(state.Delivered.Consumer), f(state.Delivered.Stream), f(sinceRefOrNow(state.TimeStamp, *state.Delivered.Last)))
+		cols.AddRowf("Last Delivered Message", "Consumer sequence: %s Stream sequence: %s Last delivery: %s ago", f(state.Delivered.Consumer), f(state.Delivered.Stream), f(iu.SinceRefOrNow(state.TimeStamp, *state.Delivered.Last)))
 	}
 
 	if config.AckPolicy != api.AckNone {
 		if state.AckFloor.Last == nil {
 			cols.AddRowf("Acknowledgment Floor", "Consumer sequence: %s Stream sequence: %s", f(state.AckFloor.Consumer), f(state.AckFloor.Stream))
 		} else {
-			cols.AddRowf("Acknowledgment Floor", "Consumer sequence: %s Stream sequence: %s Last Ack: %s ago", f(state.AckFloor.Consumer), f(state.AckFloor.Stream), f(sinceRefOrNow(state.TimeStamp, *state.AckFloor.Last)))
+			cols.AddRowf("Acknowledgment Floor", "Consumer sequence: %s Stream sequence: %s Last Ack: %s ago", f(state.AckFloor.Consumer), f(state.AckFloor.Stream), f(iu.SinceRefOrNow(state.TimeStamp, *state.AckFloor.Last)))
 		}
 		if config.MaxAckPending > 0 {
 			cols.AddRowf("Outstanding Acks", "%s out of maximum %s", f(state.NumAckPending), f(config.MaxAckPending))

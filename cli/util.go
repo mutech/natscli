@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -88,9 +88,11 @@ func selectConsumer(mgr *jsm.Manager, stream string, consumer string, force bool
 }
 
 func selectStream(mgr *jsm.Manager, stream string, force bool, all bool) (string, *jsm.Stream, error) {
-	s, err := mgr.LoadStream(stream)
-	if err == nil {
-		return s.Name(), s, nil
+	if stream != "" {
+		s, err := mgr.LoadStream(stream)
+		if err == nil {
+			return s.Name(), s, nil
+		}
 	}
 
 	streams, err := mgr.StreamNames(nil)
@@ -141,13 +143,6 @@ func selectStream(mgr *jsm.Manager, stream string, force bool, all bool) (string
 
 		return s, nil, nil
 	}
-}
-
-func sinceRefOrNow(ref time.Time, ts time.Time) time.Duration {
-	if ref.IsZero() {
-		return time.Since(ts)
-	}
-	return ref.Sub(ts)
 }
 
 func askConfirmation(prompt string, dflt bool) (bool, error) {
@@ -277,16 +272,15 @@ func natsOpts() []nats.Option {
 			time.AfterFunc(time.Second, func() { log.Fatalf(">>> Connection is closed: %v", nc.LastError()) })
 		}),
 		nats.ErrorHandler(func(nc *nats.Conn, _ *nats.Subscription, err error) {
+			if errors.Is(err, nats.ErrSlowConsumer) && !opts().Trace {
+				return
+			}
+
 			log.Printf(">>> Unexpected NATS error: %s", err)
 		}),
 		nats.ReconnectErrHandler(func(conn *nats.Conn, err error) {
 			if opts().Trace {
 				log.Printf(">>> Reconnect error: %s", err)
-			}
-		}),
-		nats.ErrorHandler(func(nc *nats.Conn, _ *nats.Subscription, err error) {
-			if opts().Trace {
-				log.Printf(">>> Unexpected NATS error: %s", err)
 			}
 		}),
 	}...)
@@ -595,6 +589,44 @@ func loadContext(softFail bool) error {
 	}
 
 	return err
+}
+
+// subjectsTable lays subject counts out in one to three column pairs
+// depending on the widest subject, in the order the names are given
+func subjectsTable(title string, names []string, subs map[string]uint64) *iu.Table {
+	var longest int
+	var most uint64
+	for _, s := range names {
+		longest = max(longest, len(s))
+		most = max(most, subs[s])
+	}
+
+	cols := 1
+	table := iu.NewTableWriter(opts(), title)
+	switch {
+	case longest+len(f(most)) < 20:
+		cols = 3
+		table.AddHeaders("Subject", "Count", "Subject", "Count", "Subject", "Count")
+	case longest+len(f(most)) < 30:
+		cols = 2
+		table.AddHeaders("Subject", "Count", "Subject", "Count")
+	default:
+		table.AddHeaders("Subject", "Count")
+	}
+
+	iu.SliceGroups(names, cols, func(g []string) {
+		row := make([]any, 0, 2*cols)
+		for _, s := range g {
+			count := ""
+			if subs[s] > 0 {
+				count = f(subs[s])
+			}
+			row = append(row, s, count)
+		}
+		table.AddRow(row...)
+	})
+
+	return table
 }
 
 func renderCluster(cluster *api.ClusterInfo) string {
