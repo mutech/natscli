@@ -51,3 +51,7 @@ dist
 natscli
 nats/nats
 nats/main
+
+# Fork dev shell (flake.nix): direnv cache, QA logs
+.direnv/
+.devshell/
