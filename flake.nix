@@ -62,7 +62,8 @@
             find . -type f -name '*.go' -not -path './.devshell/*' | grep -F -e asciigraph -v | xargs misspell -error -locale US
             staticcheck -f stylish "''${list[@]}"
           }
-          build()  { use_go "$1"; (cd nats && go build -o /dev/null); }
+          # As CI: the binary lands at nats/nats (gitignored); the FIPS tests run ../nats.
+          build()  { use_go "$1"; (cd nats && go build); }
           tests()  { use_go "$1"; pkgs_all | xargs go test -v --failfast -p=1; }
           fips()   { use_go "$1"; (cd nats/tests && CI=true go test -tags fips -v --failfast -p=1 -run FIPS .); }
           unit()   { use_go 1.27; pkgs_all | grep -v '/nats/tests$' | xargs go test -v --failfast -p=1; }
@@ -87,8 +88,11 @@
           esac
 
           rev="$(git rev-parse --short HEAD)$(git diff --quiet || echo +dirty)"
-          dir="$root/.devshell/qa/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
-          timings="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync/timings.tsv"
+          # Logs and timings live outside the tree (linters such as codespell walk
+          # it), next to each other under the upstream-sync state dir.
+          state="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync"
+          dir="$state/qa/natscli/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
+          timings="$state/timings.tsv"
           mkdir -p "$dir" "$(dirname "$timings")"
           [ -s "$timings" ] || printf 'date\trepo\trev\tstage\ttarget\tseconds\trc\thost\n' > "$timings"
           echo "qa $stage @ $rev -> $dir"
