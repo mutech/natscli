@@ -106,6 +106,84 @@ func runNatsCliWithInput(t *testing.T, input string, args ...string) ([]byte, er
 	return runNatsCliCore(t, input, nil, args...)
 }
 
+func runNatsCliBackground(t *testing.T, args ...string) <-chan string {
+	t.Helper()
+
+	out := make(chan string, 1)
+	go func() {
+		output, err := runNatsCliWithInput(t, "", args...)
+		if err != nil {
+			t.Errorf("%v: %s", err, output)
+		}
+		out <- string(output)
+	}()
+
+	return out
+}
+
+func startNatsCli(t *testing.T, srv *server.Server, nc *nats.Conn, subs int, args ...string) <-chan string {
+	t.Helper()
+
+	out := runNatsCliBackground(t, args...)
+
+	testCid, err := nc.GetClientID()
+	if err != nil {
+		t.Fatalf("could not get client id: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			connz, err := srv.Connz(&server.ConnzOptions{})
+			if err != nil {
+				t.Fatalf("connz failed: %v", err)
+			}
+
+			for _, conn := range connz.Conns {
+				if conn.Cid != testCid && conn.NumSubs >= uint32(subs) {
+					return out
+				}
+			}
+
+		case <-ctx.Done():
+			t.Fatalf("CLI did not create %d subscriptions in time", subs)
+		}
+	}
+}
+
+func startNatsCliConsumer(t *testing.T, mgr *jsm.Manager, stream string, args ...string) <-chan string {
+	t.Helper()
+
+	out := runNatsCliBackground(t, args...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			names, err := mgr.ConsumerNames(stream)
+			if err != nil {
+				t.Fatalf("consumer names failed: %v", err)
+			}
+
+			if len(names) > 0 {
+				return out
+			}
+
+		case <-ctx.Done():
+			t.Fatalf("CLI did not create a consumer on %s in time", stream)
+		}
+	}
+}
+
 func prepareHelper(servers string) (*nats.Conn, *jsm.Manager, error) {
 	nc, err := nats.Connect(servers)
 	if err != nil {
@@ -176,23 +254,28 @@ func setupJStreamTest(t *testing.T) (srv *server.Server, nc *nats.Conn, mgr *jsm
 
 func withNatsServer(t *testing.T, cb func(*testing.T, *server.Server, *nats.Conn) error) {
 	t.Helper()
-	createServersWithCallback(t, 1, false, cb)
+	createServersWithCallback(t, 1, false, "", cb)
 }
 
 func withJSServer(t *testing.T, cb func(*testing.T, *server.Server, *nats.Conn, *jsm.Manager) error) {
 	t.Helper()
-	createServersWithCallback(t, 1, true, cb)
+	createServersWithCallback(t, 1, true, "", cb)
 }
 
 func withJSCluster(t *testing.T, cb func(*testing.T, []*server.Server, *nats.Conn, *jsm.Manager) error) {
 	t.Helper()
+	withJSClusterDomain(t, "", cb)
+}
+
+func withJSClusterDomain(t *testing.T, domain string, cb func(*testing.T, []*server.Server, *nats.Conn, *jsm.Manager) error) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping on Windows due to GitHub Actions resource constraints")
 	}
-	createServersWithCallback(t, 3, true, cb)
+	createServersWithCallback(t, 3, true, domain, cb)
 }
 
-func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, cb any) {
+func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, jsDomain string, cb any) {
 	t.Helper()
 
 	d, err := os.MkdirTemp("", "jstest")
@@ -211,15 +294,16 @@ func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, cb
 
 	for i := 1; i <= serverCount; i++ {
 		opts := &server.Options{
-			JetStream:     jsEnabled,
-			StoreDir:      filepath.Join(d, fmt.Sprintf("s%d", i)),
-			Port:          -1,
-			Host:          "localhost",
-			ServerName:    fmt.Sprintf("s%d", i),
-			LogFile:       filepath.Join(d, fmt.Sprintf("s%d.log", i)),
-			Routes:        routes,
-			SystemAccount: "SYS",
-			Accounts:      []*server.Account{sysAcc},
+			JetStream:       jsEnabled,
+			JetStreamDomain: jsDomain,
+			StoreDir:        filepath.Join(d, fmt.Sprintf("s%d", i)),
+			Port:            -1,
+			Host:            "localhost",
+			ServerName:      fmt.Sprintf("s%d", i),
+			LogFile:         filepath.Join(d, fmt.Sprintf("s%d.log", i)),
+			Routes:          routes,
+			SystemAccount:   "SYS",
+			Accounts:        []*server.Account{sysAcc},
 			Users: []*server.User{{
 				Username: "sys",
 				Password: "pass",

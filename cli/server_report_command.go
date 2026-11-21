@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"github.com/fatih/color"
+	"github.com/nats-io/jsm.go/api/server/zmonitor"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
@@ -57,6 +59,7 @@ type SrvReportCmd struct {
 	gatewayName             string
 	jsEnabled               bool
 	jsServerOnly            bool
+	leafRemotesConnected    bool
 	stream                  string
 	consumer                string
 	watchInterval           int
@@ -135,6 +138,7 @@ func configureServerReportCommand(srv *fisk.CmdClause) {
 	health.Arg("limit", "Limit the responses to a certain amount of servers").IntVar(&c.waitFor)
 	health.Flag("js-enabled", "Checks that JetStream should be enabled on all servers").Short('J').BoolVar(&c.jsEnabled)
 	health.Flag("server-only", "Restricts the health check to the JetStream server only, do not check streams and consumers").Short('S').BoolVar(&c.jsServerOnly)
+	health.Flag("leaf-remotes-connected", "Checks that all enabled Leafnode remotes are connected").BoolVar(&c.leafRemotesConnected)
 	health.Flag("account", "Check only a specific Account").StringVar(&c.account)
 	health.Flag("stream", "Check only a specific Stream").StringVar(&c.stream)
 	health.Flag("consumer", "Check only a specific Consumer").StringVar(&c.consumer)
@@ -334,17 +338,15 @@ func (c *SrvReportCmd) reportHealth(_ *fisk.ParseContext) error {
 	}
 	defer src.Close()
 
-	responses, err := src.Healthz(server.HealthzEventOptions{
-		HealthzOptions: server.HealthzOptions{
-			JSEnabledOnly: c.jsEnabled,
-			JSServerOnly:  c.jsServerOnly,
-			Account:       c.account,
-			Stream:        c.stream,
-			Consumer:      c.consumer,
-			Details:       true,
-		},
-		EventFilterOptions: c.reqFilter(),
-	})
+	responses, err := src.Healthz(zmonitor.HealthzOptionsV1{
+		JSEnabledOnly:        c.jsEnabled,
+		JSServerOnly:         c.jsServerOnly,
+		LeafRemotesConnected: c.leafRemotesConnected,
+		Account:              c.account,
+		Stream:               c.stream,
+		Consumer:             c.consumer,
+		Details:              true,
+	}, c.reqFilter())
 	if err != nil {
 		return err
 	}
@@ -1383,7 +1385,7 @@ func (c *SrvReportCmd) getConnz(limit int, nc *nats.Conn) (connzList, error) {
 	env := map[string]any{}
 
 	if !c.skipDiscoverClusterSize && c.waitFor == 0 && c.archivePath == "" {
-		c.waitFor, err = serverdata.CurrentActiveServers(ctx, nc, opts().Timeout, traceLogger())
+		c.waitFor, err = serverdata.CurrentActiveServers(ctx, nc, opts().Config.JSDomain(), opts().Timeout, traceLogger())
 		if err != nil {
 			return nil, err
 		}
@@ -1595,12 +1597,14 @@ type jsDowngradeAsset struct {
 
 type jsDowngradeStreamAsset struct {
 	Account  string `json:"account"`
+	Domain   string `json:"domain,omitempty"`
 	Name     string `json:"name"`
 	APILevel uint   `json:"api_level"`
 }
 
 type jsDowngradeConsumerAsset struct {
 	Account  string `json:"account"`
+	Domain   string `json:"domain,omitempty"`
 	Name     string `json:"name"`
 	Stream   string `json:"stream"`
 	APILevel uint   `json:"api_level"`
@@ -1615,7 +1619,7 @@ func (c *SrvReportCmd) downgradeCheckAction(_ *fisk.ParseContext) error {
 		c.nc = nc
 
 		if c.waitFor == 0 {
-			c.waitFor, err = serverdata.CurrentActiveServers(ctx, nc, opts().Timeout, traceLogger())
+			c.waitFor, err = serverdata.CurrentActiveServers(ctx, nc, "", opts().Timeout, traceLogger())
 			if err != nil {
 				return fmt.Errorf("failed to get current active servers: %s", err)
 			}
@@ -1646,6 +1650,7 @@ func (c *SrvReportCmd) downgradeCheckAction(_ *fisk.ParseContext) error {
 			if incompatibleStream {
 				as.Streams = append(as.Streams, jsDowngradeStreamAsset{
 					Account:  acc.Name,
+					Domain:   acc.Domain,
 					Name:     s.Name,
 					APILevel: streamApiLevel,
 				})
@@ -1664,6 +1669,7 @@ func (c *SrvReportCmd) downgradeCheckAction(_ *fisk.ParseContext) error {
 					}
 					as.Consumers = append(as.Consumers, jsDowngradeConsumerAsset{
 						Account:  acc.Name,
+						Domain:   acc.Domain,
 						Name:     con.Name,
 						Stream:   displayStream,
 						APILevel: consumerApiLevel,
@@ -1689,13 +1695,23 @@ func (c *SrvReportCmd) renderDowngrade(as jsDowngradeAsset) {
 }
 
 func (c *SrvReportCmd) printDowngradeReport(as jsDowngradeAsset) {
+	renderDomain := slices.ContainsFunc(as.Streams, func(s jsDowngradeStreamAsset) bool { return s.Domain != "" }) ||
+		slices.ContainsFunc(as.Consumers, func(c jsDowngradeConsumerAsset) bool { return c.Domain != "" })
+
+	withDomain := func(domain string, cols ...any) []any {
+		if !renderDomain {
+			return cols
+		}
+		return append([]any{cols[0], domain}, cols[1:]...)
+	}
+
 	empty := true
 	if len(as.Streams) > 0 {
 		empty = false
 		streamsTable := iu.NewTableWriterf(opts(), "Assets: Streams")
-		streamsTable.AddHeaders("Account", "Stream", "Required API level")
+		streamsTable.AddHeaders(withDomain("Domain", "Account", "Stream", "Required API level")...)
 		for _, s := range as.Streams {
-			streamsTable.AddRow(s.Account, s.Name, s.APILevel)
+			streamsTable.AddRow(withDomain(s.Domain, s.Account, s.Name, s.APILevel)...)
 		}
 		fmt.Println(streamsTable.Render())
 	}
@@ -1703,9 +1719,9 @@ func (c *SrvReportCmd) printDowngradeReport(as jsDowngradeAsset) {
 	if len(as.Consumers) > 0 {
 		empty = false
 		consumersTable := iu.NewTableWriterf(opts(), "Assets: Consumers")
-		consumersTable.AddHeaders("Account", "Stream", "Consumer", "Required API level")
+		consumersTable.AddHeaders(withDomain("Domain", "Account", "Stream", "Consumer", "Required API level")...)
 		for _, c := range as.Consumers {
-			consumersTable.AddRow(c.Account, c.Stream, c.Name, c.APILevel)
+			consumersTable.AddRow(withDomain(c.Domain, c.Account, c.Stream, c.Name, c.APILevel)...)
 		}
 		fmt.Println(consumersTable.Render())
 	}
