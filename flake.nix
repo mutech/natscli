@@ -10,8 +10,8 @@
   #     last sync (`go list -m <module>@latest`); the qa lint target installs them
   #     the same way CI does, built with the lint job's Go. Re-resolve on every
   #     sync (own-dependency management).
-  #       honnef.co/go/tools v0.8.2 (staticcheck)  resolved 2026-11-20
-  #       github.com/client9/misspell v0.3.4       resolved 2026-11-20 (archived upstream)
+  #       honnef.co/go/tools v0.8.2 (staticcheck)  resolved 2026-11-21
+  #       github.com/client9/misspell v0.3.4       resolved 2026-11-21 (archived upstream)
   #
   # `qa fast|full|list` runs what CI runs; see qa below.
   description = "natscli (snats fork) dev shell, tool versions pinned to CI";
