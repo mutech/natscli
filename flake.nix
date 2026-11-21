@@ -104,10 +104,12 @@
 
           rev="$(git rev-parse --short HEAD)$(git diff --quiet || echo +dirty)"
           # Logs and timings live outside the tree (linters such as codespell walk
-          # it), next to each other under the upstream-sync state dir.
+          # it), next to each other under the upstream-sync state dir. QA_LOG_DIR
+          # overrides that: the upstream sync points it at its session's qa/.
           state="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync"
-          dir="$state/qa/natscli/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
-          timings="$state/timings.tsv"
+          qa_root="''${QA_LOG_DIR:-$state/qa}"
+          dir="$qa_root/natscli/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
+          if [ -n "''${QA_LOG_DIR:-}" ]; then timings="$QA_LOG_DIR/timings.tsv"; else timings="$state/timings.tsv"; fi
           mkdir -p "$dir" "$(dirname "$timings")"
           [ -s "$timings" ] || printf 'date\trepo\trev\tstage\ttarget\tseconds\trc\thost\n' > "$timings"
           echo "qa $stage @ $rev -> $dir"
