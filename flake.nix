@@ -33,6 +33,21 @@
         exec ${pkgs.bash}/bin/bash ${pkgs.git}/share/git/contrib/rerere-train.sh "$@"
       '';
 
+      # commit-msg gate, the same check in every snats repository: rejects messages
+      # naming "claude"/"anthropic" (case-insensitive) or carrying a "co-authored-by"
+      # line. Fails closed: anything but a clean grep miss rejects. The shellHook
+      # installs a copy, not a link: git silently skips a dangling hook symlink after
+      # a GC, while a copy whose interpreter is gone makes the commit fail.
+      noAttribution = pkgs.writeShellScriptBin "no-attribution" ''
+        set -u
+        msg="''${1:-}"
+        [ -f "$msg" ] || { echo "no-attribution: no commit message file" >&2; exit 1; }
+        rc=0; ${pkgs.gnugrep}/bin/grep -iqE 'claude|anthropic|co-authored-by' "$msg" || rc=$?
+        [ "$rc" -eq 1 ] && exit 0
+        echo "REJECTED: attempt to steal intellectual property or place unsolicited advertizing detected"
+        exit 1
+      '';
+
       # QA runner. Every target's full output goes to its own log, wall time and
       # exit code to summary.tsv and to the cross-session timings file. No
       # timeouts. All targets run even if one fails.
@@ -115,6 +130,15 @@
         packages = [ goLint pkgs.git rerereTrain qa ];
 
         shellHook = ''
+          # Install the commit gate into this repository only, not into a
+          # superproject this shell was started from (`nix develop <path>`).
+          top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+          if [ -n "$top" ] && cmp -s "$top/flake.nix" ${./flake.nix}; then
+            hooks="$(git -C "$top" rev-parse --path-format=absolute --git-common-dir)/hooks-no-attribution"
+            mkdir -p "$hooks"
+            install -m 0755 ${noAttribution}/bin/no-attribution "$hooks/commit-msg"
+            git -C "$top" config core.hooksPath "$hooks"
+          fi
           cache="''${XDG_CACHE_HOME:-$HOME/.cache}/nats-fork-devshell"
           export GOPATH="$cache/go"
           export GOMODCACHE="$cache/go/pkg/mod"
