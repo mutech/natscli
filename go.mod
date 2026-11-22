@@ -82,3 +82,6 @@ require (
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+// nats-server fork (UDS peer-credential auth), pinned by upstream-sync session 2026-11-21-2 (mutech/nats-server 625dbd5fe).
+replace github.com/nats-io/nats-server/v2 => github.com/mutech/nats-server/v2 v2.14.1-0.20261121184620-625dbd5feae0
